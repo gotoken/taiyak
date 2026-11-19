@@ -197,14 +197,30 @@ function keyFor(path, b) { return `${S.lang}|${S.style}|${CORE.hashStr(path + "\
 function getTr(path, b) { return MEM.get(keyFor(path, b)) || null; }
 function putTr(path, b, tr, model) {
   const k = keyFor(path, b);
-  const v = { tr, path, id: b.id, name: b.name || "", repo: S.source ? S.source.label : "", lang: S.lang, style: S.style, model, at: Date.now() };
+  const v = { tr, path, id: b.id, name: b.name || "", repo: S.source ? S.source.label : "", sourceId: S.source && S.source.sourceId, lang: S.lang, style: S.style, model, at: Date.now() };
   MEM.set(k, v); idbPut(k, v);
 }
 
 // ---------- sources ----------
+// A source ID identifies an exact snapshot, not a display label or a cache key.
+// If hashing is unavailable, keep the source readable but do not attest its provenance.
+async function sourceDigest(bytes) {
+  try {
+    const hash = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(hash), b => b.toString(16).padStart(2, "0")).join("");
+  } catch (e) { return null; }
+}
+async function sourceManifest(kind, entries) {
+  const hash = await sourceDigest(new TextEncoder().encode(JSON.stringify(entries)));
+  return hash && kind + ":" + hash;
+}
 class MemorySource {
   constructor(label, files, note) { this.label = label; this.files = files; this.note = note; this.kind = "demo"; }
-  async init() { return Object.keys(this.files); }
+  async init() {
+    const paths = Object.keys(this.files).sort();
+    this.sourceId = await sourceManifest("demo", paths.map(p => [p, this.files[p]]));
+    return paths;
+  }
   async read(p) { if (!(p in this.files)) throw new Error("not found: " + p); return this.files[p]; }
 }
 class ZipSource {
@@ -212,6 +228,8 @@ class ZipSource {
   async init() {
     if (!window.JSZip) throw new Error("JSZip did not load");
     this.zip = await JSZip.loadAsync(this.file);
+    const hash = await this.file.arrayBuffer().then(sourceDigest, () => null);
+    this.sourceId = hash && "zip:" + hash;
     const names = Object.keys(this.zip.files).filter(n => !this.zip.files[n].dir);
     const tops = new Set(names.map(n => n.split("/")[0]));
     this.prefix = (tops.size === 1 && names.every(n => n.includes("/"))) ? [...tops][0] + "/" : "";
@@ -225,7 +243,15 @@ class FolderSource {
   async init() {
     this.map = new Map();
     for (const f of this.list) { const rp = f.webkitRelativePath || f.name; const p = rp.includes("/") ? rp.split("/").slice(1).join("/") : rp; this.map.set(p, f); }
-    return [...this.map.keys()];
+    const paths = [...this.map.keys()].sort();
+    const entries = [];
+    for (const p of paths) {
+      const hash = await this.map.get(p).arrayBuffer().then(sourceDigest, () => null);
+      if (!hash) { this.sourceId = null; return paths; }
+      entries.push([p, hash]);
+    }
+    this.sourceId = await sourceManifest("folder", [this.label, entries]);
+    return paths;
   }
   async read(p) { const f = this.map.get(p); if (!f) throw new Error("not found: " + p); return f.text(); }
 }
@@ -245,6 +271,7 @@ class GitHubSource {
   async init() {
     const { owner, repo, refPath } = this.p;
     const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    const info = await (await this.api(base)).json();
     let ref = null, sub = [];
     if (refPath && refPath.length) {
       for (let k = 1; k <= Math.min(4, refPath.length); k++) {
@@ -254,11 +281,12 @@ class GitHubSource {
       }
     }
     if (!ref) {
-      const info = await (await this.api(base)).json();
       ref = info.default_branch;
       const r = await this.api(`${base}/commits/${encodeURIComponent(ref)}`, "application/vnd.github.sha");
       this.sha = (await r.text()).trim();
     }
+    this.sourceId = Number.isSafeInteger(info.id) && /^[0-9a-f]{40,64}$/i.test(this.sha)
+      ? "github:" + info.id + ":" + this.sha.toLowerCase() : null;
     this.ref = ref; this.base = base; this.label = `${owner}/${repo} @ ${ref} (${this.sha.slice(0, 7)})`;
     if (sub.length) this.openPath = sub.join("/");
     const tree = await (await this.api(`${base}/git/trees/${this.sha}?recursive=1`)).json();
@@ -565,11 +593,13 @@ function buildTree() {
 }
 
 async function loadSource(src) {
+  S.loadingSource = src;
   setStatus(t("loading"));
   $("#repoLabel").textContent = "…";
   S.job && S.job.abort();
   try {
     const paths = await src.init();
+    if (S.loadingSource !== src) return;
     S.source = src; S.paths = paths; S.lastFailed = null; $("#hint").hidden = true;
     if (!S.inArtifact && src.kind !== "github" && location.search) { try { history.replaceState(null, "", location.pathname); } catch (e) { } } S.texts.clear(); S.blocks.clear(); S.idxFiles.clear(); S.idx = new Map(); S.hist = []; S.cur = null;
     $("#repoLabel").textContent = src.label;
@@ -580,6 +610,7 @@ async function loadSource(src) {
     buildTree();
     setStatus("");
     const nb = await loadBundles(src, paths);
+    if (S.loadingSource !== src) return;
     if (nb) setStatus(t("bundled", nb));
     let first = src.openPath && lean.find(p => p === src.openPath || p.startsWith(src.openPath + "/"));
     if (!first) first = src.startPath || lean.find(p => /(^|\/)(Main|Basic)\.lean$/.test(p)) || lean[0];
@@ -589,10 +620,13 @@ async function loadSource(src) {
       const fb = bl.find(b => src.focus.decl && b.name === src.focus.decl) || bl.find(b => b.id === src.focus.id);
       fid = fb ? fb.id : null;
     }
-    if (first) await openFile(first, fid, false);
+    if (first && S.loadingSource === src) await openFile(first, fid, false);
   } catch (e) {
+    if (S.loadingSource !== src) return;
     setStatus(e.message || String(e), "err");
     if (src.kind === "github") { S.lastFailed = (e.status === 404 || e.status === 401) ? src : null; showGhHint(src.p, e.status); }
+  } finally {
+    if (S.loadingSource === src) S.loadingSource = null;
   }
 }
 async function loadBundles(src, paths) {
@@ -661,13 +695,17 @@ function showGhHint(p, status) {
 
 async function readFile(p) {
   if (S.texts.has(p)) return S.texts.get(p);
-  const tx = await S.source.read(p);
+  const source = S.source;
+  const tx = await source.read(p);
+  if (S.source !== source) throw new Error("Source changed");
   S.texts.set(p, tx);
   return tx;
 }
 async function blocksOf(p) {
   if (S.blocks.has(p)) return S.blocks.get(p);
+  const source = S.source;
   const b = CORE.splitLean(await readFile(p));
+  if (S.source !== source) throw new Error("Source changed");
   S.blocks.set(p, b);
   return b;
 }
@@ -678,11 +716,12 @@ function indexFile(p, blocks) {
 }
 // load imports (transitively, bounded) and index them
 async function loadImports(p, maxFiles = 30, maxDepth = 3) {
+  const source = S.source;
   const seen = new Set([p]); let frontier = [p], depth = 0, count = 0;
   while (frontier.length && depth < maxDepth && count < maxFiles) {
     const next = [];
     for (const f of frontier) {
-      const tx = await readFile(f).catch(() => null); if (tx == null) continue;
+      const tx = await readFile(f).catch(() => null); if (S.source !== source) return; if (tx == null) continue;
       for (const mod of CORE.importsOf(tx)) {
         const mp = CORE.modulePath(mod, S.paths);
         if (!mp || seen.has(mp)) continue;
@@ -691,7 +730,11 @@ async function loadImports(p, maxFiles = 30, maxDepth = 3) {
       }
       if (count >= maxFiles) break;
     }
-    await Promise.all(next.map(async f => { try { indexFile(f, await blocksOf(f)); } catch (e) { } }));
+    await Promise.all(next.map(async f => {
+      if (S.source !== source) return;
+      try { const blocks = await blocksOf(f); if (S.source === source) indexFile(f, blocks); } catch (e) { }
+    }));
+    if (S.source !== source) return;
     frontier = next; depth++;
   }
 }
@@ -710,7 +753,9 @@ async function openFile(p, focusId, push = true) {
   $("#path").textContent = p;
   $("#blocks").innerHTML = `<p class="muted pad">${t("loading")}</p>`;
   let blocks;
-  try { blocks = await blocksOf(p); } catch (e) { $("#blocks").innerHTML = `<p class="err pad">${esc(e.message)}</p>`; return; }
+  const source = S.source;
+  try { blocks = await blocksOf(p); } catch (e) { if (S.source === source && S.cur === p) $("#blocks").innerHTML = `<p class="err pad">${esc(e.message)}</p>`; return; }
+  if (S.source !== source || S.cur !== p) return;
   indexFile(p, blocks);
   renderBlocks(p, blocks);
   updateCounts();
@@ -785,11 +830,15 @@ function markRefs() {
 
 // ---------- translation jobs ----------
 async function translate(p, which, opts = {}) {
-  if (S.job) return;
+  if (S.job || S.loadingSource || !S.source) return;
+  const source = S.source, lang = S.lang, style = S.style;
+  const unchanged = () => S.source === source && !S.loadingSource && S.lang === lang && S.style === style;
   if (!engineOK()) { setStatus(t("noEngine"), "err"); openSettings(); return; }
-  const all = await blocksOf(p);
-  const fileText = await readFile(p);
-  let todo = which.filter(b => b.cls !== "struct" && (opts.force || !getTr(p, b)));
+  let all, fileText;
+  try { all = await blocksOf(p); fileText = await readFile(p); } catch (e) { return; }
+  if (!unchanged() || S.job) return;
+  const requested = new Map(which.map(b => [b.id, b.text]));
+  let todo = all.filter(b => requested.get(b.id) === b.text && b.cls !== "struct" && (opts.force || !getTr(p, b)));
   if (!todo.length) return;
   // Chrome's built-in model has a small context: a block or two at a time, little context, proofs elided.
   const small = !S.sample && PROVIDERS[S.provider].local;
@@ -804,10 +853,11 @@ async function translate(p, which, opts = {}) {
   try {
     setStatus(t("loading"));
     await loadImports(p);
+    if (!unchanged() || ctl.signal.aborted) return;
     markRefs();
     const ctx = CORE.collectContext(p, all, S.idx, small ? 2500 : undefined);
     for (let i = 0; i < chunks.length; i++) {
-      if (ctl.signal.aborted) break;
+      if (ctl.signal.aborted || !unchanged()) break;
       const chunk = chunks[i];
       let prompt = CORE.buildPrompt({ repoLabel: S.source.label, path: p, lang: S.lang, style: S.style, blocks: chunk, allBlocks: all, context: ctx, fileText, elide: small });
       if (new Blob([prompt]).size > 230000) prompt = CORE.buildPrompt({ repoLabel: S.source.label, path: p, lang: S.lang, style: S.style, blocks: chunk, allBlocks: all, context: ctx.slice(0, 8000), fileText, elide: true });
@@ -819,6 +869,7 @@ async function translate(p, which, opts = {}) {
       try {
         res = await callLLM(prompt, text => { setStatus(pre + t("receiving", text.length), "recv"); }, ctl.signal);
       } finally { clearInterval(tick); }
+      if (ctl.signal.aborted || !unchanged()) break;
       const arr = CORE.parseReply(res.text);
       if (!arr.length) throw new Error(t("parseErr"));
       for (const o of arr) {
@@ -1132,13 +1183,18 @@ function saveSettings() {
   const um = $("#uiLang").value; if (um !== S.uiMode) { S.uiMode = um; LS.set("uiMode", um); LS.del("ui"); applyUI(); refresh(); }
   if (!hadKey && engineOK()) startGlossJob();
 }
-function exportJSON() {
-  const have = new Set(S.paths);
-  const rows = [...MEM].filter(([k, v]) => v && v.tr && have.has(v.path) && (!v.demo || (S.source && S.source.kind === "demo")));
+async function exportJSON() {
+  const source = S.source;
+  if (!source || S.loadingSource || !source.sourceId) throw new Error("Cannot establish the source identity for export");
+  // Read from the captured source rather than the mutable UI caches. Never export
+  // on behalf of a different source, even if it was opened during these reads.
+  const rows = await CORE.exportableTranslations([...MEM], source.sourceId, [...S.paths],
+    async p => CORE.splitLean(await source.read(p)));
+  if (S.source !== source || S.loadingSource) throw new Error("Source changed during export");
   rows.sort((a, b) => (a[1].lang + a[1].path).localeCompare(b[1].lang + b[1].path) || (parseInt(String(a[1].id).slice(1)) - parseInt(String(b[1].id).slice(1))));
   const entries = {};
-  for (const [k, v] of rows) entries[k] = { path: v.path, id: v.id, name: v.name || "", lang: v.lang, style: v.style, model: String(v.model || "").replace(/ · bundled$/, ""), at: v.at || null, tr: v.tr };
-  return JSON.stringify({ format: "taiyak/1", repo: S.source ? S.source.label : "", exported: new Date().toISOString(), entries }, null, 1);
+  for (const [k, v] of rows) entries[k] = { path: v.path, id: v.id, name: v.name || "", lang: v.lang, style: v.style, model: String(v.model || "").replace(/ · bundled$/, ""), at: v.at || null, sourceId: v.sourceId, tr: v.tr };
+  return JSON.stringify({ format: "taiyak/1", repo: source.label, exported: new Date().toISOString(), entries }, null, 1);
 }
 
 // ---------- events ----------
@@ -1204,9 +1260,14 @@ function bind() {
   $("#hint").addEventListener("click", e => { if (e.target.closest("#hintSettings")) openSettings(); });
   $("#sClose").addEventListener("click", () => { saveSettings(); $("#settings").hidden = true; });
   $("#settings").addEventListener("click", e => { if (e.target.id === "settings") { saveSettings(); $("#settings").hidden = true; } });
-  $("#sCopy").addEventListener("click", async () => { try { await navigator.clipboard.writeText(exportJSON()); toast(t("copied")); } catch (e) { $("#sImportTxt").value = exportJSON(); $("#sImportTxt").select(); } });
-  $("#sDownload").addEventListener("click", () => {
-    try { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([exportJSON()], { type: "application/json" })); a.download = "taiyak.json"; document.body.appendChild(a); a.click(); a.remove(); } catch (e) { }
+  $("#sCopy").addEventListener("click", async () => {
+    let json;
+    try { json = await exportJSON(); } catch (e) { toast(e.message); return; }
+    try { await navigator.clipboard.writeText(json); toast(t("copied")); }
+    catch (e) { $("#sImportTxt").value = json; $("#sImportTxt").select(); }
+  });
+  $("#sDownload").addEventListener("click", async () => {
+    try { const json = await exportJSON(); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([json], { type: "application/json" })); a.download = "taiyak.json"; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); } catch (e) { toast(e.message); }
   });
   const doImport = txt => {
     try { const d = JSON.parse(txt); let n = 0; for (const [k, v] of Object.entries(d.entries || {})) { MEM.set(k, v); idbPut(k, v); n++; } toast(t("imported", n)); refresh(); } catch (e) { toast(e.message); }
@@ -1226,10 +1287,12 @@ async function boot() {
   // demo data
   const demo = JSON.parse(document.getElementById("demo-data").textContent);
   const demoTr = JSON.parse(document.getElementById("demo-tr").textContent);
+  const demoSource = new MemorySource(demo.label, demo.files, t("demoNote"));
+  await demoSource.init();
   for (const [lang, byPath] of Object.entries(demoTr)) {
     for (const [p, m] of Object.entries(byPath)) {
       const bl = CORE.splitLean(demo.files[p]);
-      for (const b of bl) { const tr = m[b.id]; if (!tr) continue; const k = `${lang}|normal|${CORE.hashStr(p + "\n" + b.text)}`; MEM.set(k, { tr, path: p, id: b.id, name: b.name || "", repo: demo.label, lang, style: "normal", model: "Claude (demo)", demo: true }); }
+      for (const b of bl) { const tr = m[b.id]; if (!tr) continue; const k = `${lang}|normal|${CORE.hashStr(p + "\n" + b.text)}`; MEM.set(k, { tr, path: p, id: b.id, name: b.name || "", repo: demo.label, sourceId: demoSource.sourceId, lang, style: "normal", model: "Claude (demo)", demo: true }); }
     }
   }
   if (!S.inArtifact) await orCallback();
@@ -1249,9 +1312,8 @@ async function boot() {
     $("#url").value = `https://github.com/${qp.owner}/${qp.repo}`;
     await loadSource(gs);
   } else {
-    const src = new MemorySource(demo.label, demo.files, t("demoNote"));
-    src.startPath = demo.start;
-    await loadSource(src);
+    demoSource.startPath = demo.start;
+    await loadSource(demoSource);
   }
   // translator availability
   if (S.inArtifact) {
