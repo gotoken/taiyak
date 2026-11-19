@@ -509,6 +509,29 @@ function parseGitHubURL(input) {
   return out;
 }
 
-const CORE = { splitLean, statementPart, proofSplit, identifiers, buildIndex, lookupIdent, importsOf, modulePath,
+// Export is stricter than the display cache: require recorded provenance and a current block.
+async function exportableTranslations(rows, sourceId, paths, readBlocks) {
+  if (!sourceId) return [];
+  const allowed = new Set(paths);
+  const byPath = new Map();
+  for (const [key, v] of rows) {
+    if (!v || !v.tr || v.sourceId !== sourceId || !allowed.has(v.path)) continue;
+    if (typeof v.lang !== "string" || typeof v.style !== "string") continue;
+    if (!byPath.has(v.path)) byPath.set(v.path, []);
+    byPath.get(v.path).push([key, v]);
+  }
+  const result = [];
+  for (const [path, candidates] of byPath) {
+    let blocks;
+    try { blocks = await readBlocks(path); } catch (e) { continue; }
+    const hashes = new Map(blocks.filter(b => b.cls !== "struct").map(b => [b.id, hashStr(path + "\n" + b.text)]));
+    for (const [key, v] of candidates) {
+      if (hashes.has(v.id) && key === `${v.lang}|${v.style}|${hashes.get(v.id)}`) result.push([key, v]);
+    }
+  }
+  return result;
+}
+
+const CORE = { exportableTranslations, splitLean, statementPart, proofSplit, identifiers, buildIndex, lookupIdent, importsOf, modulePath,
   collectContext, chunkBlocks, buildPrompt, extractJSONArray, salvageObjects, parseReply, parseObject, splitSSE, foldGemini, hashStr, parseGitHubURL, declName, headKeyword, codeOnly };
 if (typeof module !== "undefined") module.exports = CORE;

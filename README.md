@@ -56,6 +56,8 @@ Example: <https://taiyak.pages.dev/?repo=Broyojo/python-formalization&path=lean/
 2. Use "Settings" → "Export translations" to get a JSON file (only the repository you have open is exported)
 3. Commit it to the target repository as `.taiyak/en.json` (one file per language; any name works)
 
+Exports include only records with a matching source snapshot and current block. GitHub snapshots use the repository ID and full commit SHA; ZIP and folder snapshots use SHA-256 fingerprints. Older cached or imported translations without verifiable provenance can still be read, but are not exported. Retranslate a block if you need to export it for the current snapshot. The display cache and bundled translation format remain compatible.
+
 Opening a repository loads `.taiyak/*.json` automatically. A translation you made yourself for the same block takes precedence. Translations are matched by language, detail level and a hash of the file path and block text, so when the code of a block changes, its old translation is no longer used.
 
 ## Keys and data

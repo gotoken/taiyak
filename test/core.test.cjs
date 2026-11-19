@@ -144,3 +144,32 @@ test("foldGemini joins answer parts, skips thoughts and keeps the finish reason"
   assert.equal(C.foldGemini(null, { promptFeedback: { blockReason: "SAFETY" } }).block, "SAFETY");
   assert.throws(() => C.foldGemini(null, { error: { code: 504, message: "Deadline exceeded" } }), /504/);
 });
+
+test("export requires source provenance and current block content", async () => {
+  const src = "github:1:abc", other = "github:2:abc";
+  const path = "Main.lean";
+  const old = C.splitLean("def old := 1")[0], current = C.splitLean("def current := 2")[0];
+  const row = (sourceId, block, lang = "English", style = "normal", p = path) => [
+    lang + "|" + style + "|" + C.hashStr(p + "\n" + block.text),
+    { sourceId, path: p, id: block.id, lang, style, tr: { title: "translation" } }
+  ];
+  const expected = [row(src, current), row(src, current, "日本語", "detailed")];
+  const rows = [...expected, row(other, current), row(other, old), row(src, old),
+    row(undefined, current), row(src, current, "English", "normal", "Removed.lean")];
+  assert.deepEqual(await C.exportableTranslations(rows, src, [path], async () => [current]), expected);
+  assert.deepEqual(await C.exportableTranslations(rows, null, [path], async () => [current]), []);
+  assert.deepEqual(await C.exportableTranslations(rows, src, [path], async () => { throw new Error("unreadable"); }), []);
+});
+
+test("export distinguishes local snapshots even with the same path and block", async () => {
+  const path = "Main.lean", b = C.splitLean("def same := 1")[0];
+  const k = "English|normal|" + C.hashStr(path + "\n" + b.text);
+  const record = { path, id: b.id, lang: "English", style: "normal", tr: { title: "translation" } };
+  const rows = [
+    [k, { ...record, sourceId: "zip:one" }],
+    [k, { ...record, sourceId: "folder:two" }],
+    [k, { ...record, sourceId: "zip:three" }]
+  ];
+  assert.deepEqual(await C.exportableTranslations(rows, "zip:one", [path], async () => [b]), [rows[0]]);
+  assert.deepEqual(await C.exportableTranslations(rows, "folder:two", [path], async () => [b]), [rows[1]]);
+});
